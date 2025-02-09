@@ -15,10 +15,12 @@ from .ocr.processor import OCRProcessor
 from .config import settings
 from .logger import get_logger
 from .database import get_db, engine, Base
+import sys
+import pytesseract
 
 # Initialize logger
 logger = get_logger()
-
+print(sys.path)
 # Create database tables
 Base.metadata.create_all(bind=engine)
 
@@ -60,6 +62,8 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
 
 ocr_processor = OCRProcessor()
+
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'  # Default install path
 
 def create_access_token(data: dict):
     to_encode = data.copy()
@@ -141,92 +145,88 @@ async def rate_limit_middleware(request: Request, call_next):
 @app.post(f"{settings.API_V1_STR}/process-image/", response_model=ProductData)
 async def process_image(
     file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Session = Depends(get_db)
 ):
-    if not current_user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    logger.info(f"Processing single image: {file.filename}")
-    
-    if file.content_type not in settings.SUPPORTED_FORMATS:
-        logger.error(f"Unsupported file format: {file.content_type}")
-        raise HTTPException(400, f"Unsupported file format. Supported formats: {settings.SUPPORTED_FORMATS}")
-    
     try:
-        file_size = 0
-        contents = bytearray()
+        # Removed authentication check
+        if file.content_type not in settings.SUPPORTED_FORMATS:
+            logger.error(f"Unsupported file format: {file.content_type}")
+            raise HTTPException(400, f"Unsupported file format. Supported formats: {settings.SUPPORTED_FORMATS}")
         
-        # Read file in chunks to check size
-        chunk_size = 1024 * 1024  # 1MB chunks
-        while True:
-            chunk = await file.read(chunk_size)
-            if not chunk:
-                break
-            file_size += len(chunk)
-            if file_size > settings.MAX_UPLOAD_SIZE:
-                logger.error(f"File too large: {file_size} bytes")
-                raise HTTPException(400, f"File too large. Maximum size: {settings.MAX_UPLOAD_SIZE} bytes")
-            contents.extend(chunk)
+        logger.info(f"Processing single image: {file.filename}")
         
-        await file.seek(0)
-        
-        # Check cache if Redis is available
-        if REDIS_AVAILABLE:
-            cache_key = f"image:{hash(contents)}"
-            cached_result = redis_client.get(cache_key)
-            if cached_result:
-                return ProductData.parse_raw(cached_result)
-        
-        nparr = np.frombuffer(contents, np.uint8)
-        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if image is None:
-            logger.error(f"Invalid image format or corrupted file: {file.filename}")
-            raise HTTPException(400, "Invalid image format or corrupted file")
-        
-        product_data = ocr_processor.extract_product_info(image)
-        
-        # Save to database
-        db_product = Product(**product_data.dict(), user_id=current_user.id)
-        db.add(db_product)
-        db.commit()
-        db.refresh(db_product)
-        
-        # Cache the result if Redis is available
-        if REDIS_AVAILABLE:
-            redis_client.setex(
-                cache_key,
-                settings.CACHE_TTL,
-                ProductData.from_orm(db_product).json()
+        try:
+            file_size = 0
+            contents = bytearray()
+            
+            # Read file in chunks to check size
+            chunk_size = 1024 * 1024  # 1MB chunks
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                file_size += len(chunk)
+                if file_size > settings.MAX_UPLOAD_SIZE:
+                    logger.error(f"File too large: {file_size} bytes")
+                    raise HTTPException(400, f"File too large. Maximum size: {settings.MAX_UPLOAD_SIZE} bytes")
+                contents.extend(chunk)
+            
+            await file.seek(0)
+            
+            # Check cache if Redis is available
+            if REDIS_AVAILABLE:
+                cache_key = f"image:{hash(contents)}"
+                cached_result = redis_client.get(cache_key)
+                if cached_result:
+                    return ProductData.parse_raw(cached_result)
+            
+            nparr = np.frombuffer(contents, np.uint8)
+            image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if image is None:
+                logger.error(f"Invalid image format or corrupted file: {file.filename}")
+                raise HTTPException(400, "Invalid image format or corrupted file")
+            
+            product_data = ocr_processor.extract_product_info(image)
+            
+            # Create product with explicit user ID
+            db_product = Product(
+                **product_data.dict(exclude={"id", "created_at"}),  # Exclude auto-generated fields
+                user_id=0  # Temporary default value
             )
-        
-        logger.info(f"Successfully processed image: {file.filename}")
-        return ProductData.from_orm(db_product)
-        
-    except HTTPException:
-        raise
+            
+            # Save to database
+            db.add(db_product)
+            db.commit()
+            db.refresh(db_product)
+            
+            # Cache the result if Redis is available
+            if REDIS_AVAILABLE:
+                redis_client.setex(
+                    cache_key,
+                    settings.CACHE_TTL,
+                    ProductData.from_orm(db_product).json()
+                )
+            
+            logger.info(f"Successfully processed image: {file.filename}")
+            return ProductData.from_orm(db_product)
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception(f"Error processing image {file.filename}: {str(e)}")
+            raise HTTPException(500, f"Error processing image: {str(e)}")
+
     except Exception as e:
-        logger.exception(f"Error processing image {file.filename}: {str(e)}")
-        raise HTTPException(500, f"Error processing image: {str(e)}")
+        logger.error(f"Error processing image {file.filename}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
 
 @app.post(f"{settings.API_V1_STR}/process-bulk/", response_model=List[ProductData])
 async def process_bulk_images(
     files: List[UploadFile] = File(...),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    db: Session = Depends(get_db)
 ):
-    if not current_user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
+    # Removed authentication check
     logger.info(f"Processing bulk images: {len(files)} files")
     results = []
     errors = []
@@ -259,7 +259,7 @@ async def process_bulk_images(
                 product_data = ocr_processor.extract_product_info(image)
                 
                 # Save to database
-                db_product = Product(**product_data.dict(), user_id=current_user.id)
+                db_product = Product(**product_data.dict(), user_id=0)
                 db.add(db_product)
                 db.commit()
                 db.refresh(db_product)

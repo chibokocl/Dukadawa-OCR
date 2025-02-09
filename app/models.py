@@ -1,10 +1,11 @@
 # app/models.py
-from sqlalchemy import Column, Integer, String, Date, Boolean, DateTime, Text
+from sqlalchemy import Column, Integer, String, Date, Boolean, DateTime, Text, ForeignKey
 from sqlalchemy.sql import func
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import date, datetime
 from .database import Base
+from uuid import UUID, uuid4
 
 # SQLAlchemy Models
 class UserDB(Base):
@@ -17,6 +18,7 @@ class UserDB(Base):
 
 class Product(Base):
     __tablename__ = "products"
+    __table_args__ = {'extend_existing': True}
 
     id = Column(Integer, primary_key=True, index=True)
     certificate_number = Column(String(50), unique=True, index=True)
@@ -33,7 +35,7 @@ class Product(Base):
     display_name = Column(String(300))
     pack_size = Column(String(50))
     image_url = Column(String(500))
-    expiry_date = Column(Date)
+    expiry_date = Column(String)
     batch_number = Column(String(50))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -85,11 +87,19 @@ class ProductBase(BaseModel):
 class ProductCreate(ProductBase):
     pass
 
-class ProductData(ProductBase):
-    id: int
-    created_at: datetime
-    updated_at: Optional[datetime] = None
-    user_id: Optional[int] = None
+class ProductData(BaseModel):
+    id: int | None = None
+    created_at: datetime | None = None
+    certificate_number: str | None = None
+    brand_name: str | None = None
+    generic_name: str | None = None
+    dosage_form: str | None = None
+    manufacturer: str | None = None
+    strength: str | None = None
+    batch_number: str | None = None
+    expiry_date: str | None = None
+    image_url: str | None = None
 
     class Config:
         from_attributes = True
+        arbitrary_types_allowed = True
